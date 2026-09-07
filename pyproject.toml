@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "matter-blind-controller"
+version = "0.1.0"
+description = "Monitor IKEA Matter contact sensors for blind position on a Raspberry Pi"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+authors = [{ name = "Paul" }]
+dependencies = [
+  "aiohttp>=3.9.0",
+  "PyYAML>=6.0",
+  "python-matter-server>=8.1.0,<9",
+]
+
+[project.scripts]
+matter-blind-controller = "matter_blind_controller.main:main"
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src",
+  "/config.example.yaml",
+  "/README.md",
+  "/LICENSE",
+]

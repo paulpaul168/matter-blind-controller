@@ -1,0 +1,15 @@
+matter:
+  url: ws://127.0.0.1:5580/ws
+  reconnect_initial_seconds: 2
+  reconnect_max_seconds: 60
+
+logging:
+  level: INFO
+
+# Map Matter node IDs to friendly sensor names.
+# Replace the example IDs with values from the discovery log on first run.
+sensors:
+  10: top
+  11: bottom
+  12: left
+  13: right
