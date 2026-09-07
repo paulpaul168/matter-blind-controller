@@ -12,16 +12,18 @@ This foundation does **not** control a blind motor yet.
 ## Architecture
 
 ```text
-IKEA Thread sensors ──► SONOFF USB Thread dongle ──► python-matter-server
-                                                         │
-                                              WebSocket (ws://host:5580/ws)
-                                                         │
-                                              matter-blind-controller
-                                                         │
-                                              logs: top: OPEN / …
+IKEA Thread sensors ──► Thread network (SONOFF USB / OTBR)
+                              │
+                    python-matter-server  (Docker, auto-restart)
+                              │
+                   WebSocket ws://host:5580/ws
+                              │
+                    matter-blind-controller
+                              │
+                    logs: top: OPEN / …
 ```
 
-- The **Matter Server** owns the Thread radio, fabric, commissioning, and device subscriptions.
+- The **Matter Server** owns the Matter fabric, commissioning, and device subscriptions.
 - This app is a **client only** (no Home Assistant dependency in application code).
 - Contact sensors use Matter `BooleanState.StateValue`: `True` → `CLOSED`, `False` → `OPEN`.
 
@@ -29,39 +31,120 @@ IKEA Thread sensors ──► SONOFF USB Thread dongle ──► python-matter-s
 
 ## Requirements
 
-- Raspberry Pi (or any Linux host) with Python **3.12+**
-- SONOFF USB Thread / Zigbee-Thread dongle (or another supported 802.15.4 radio)
-- A running **python-matter-server** instance with the four IKEA sensors already commissioned into its fabric
+- Raspberry Pi (or Linux host) with Python **3.12+**
+- SONOFF USB Thread dongle (or another OpenThread RCP) plus a working **Thread Border Router** on the same LAN
+- Bluetooth on the Pi (for first-time Thread commissioning over BLE)
+- Docker with Compose
 
-## Raspberry Pi setup
+## 1. Matter Server (Docker, auto-restart)
 
-### 1. Matter Server (Docker)
-
-On the Pi, plug in the SONOFF USB dongle, then run the official container with host networking (required for Matter/mDNS/Thread):
+Create a folder and `docker-compose.yml` on the Pi:
 
 ```bash
 mkdir -p ~/matter-server/data
-docker run -d \
-  --name matter-server \
-  --restart=unless-stopped \
-  --security-opt apparmor=unconfined \
-  -v ~/matter-server/data:/data \
-  -v /run/dbus:/run/dbus:ro \
-  --network=host \
-  ghcr.io/matter-js/python-matter-server:stable
+cd ~/matter-server
 ```
 
-The WebSocket API listens on `ws://127.0.0.1:5580/ws` by default.
+```yaml
+# ~/matter-server/docker-compose.yml
+services:
+  matter-server:
+    image: ghcr.io/matter-js/python-matter-server:stable
+    container_name: matter-server
+    restart: unless-stopped
+    network_mode: host
+    security_opt:
+      - apparmor:unconfined
+    volumes:
+      - ./data:/data
+      # Needed so the server can use host Bluetooth to commission Thread sensors
+      - /run/dbus:/run/dbus:ro
+    # Explicit command keeps BLE commissioning enabled after restarts
+    command: >
+      --storage-path /data
+      --paa-root-cert-dir /data/credentials
+      --bluetooth-adapter 0
+```
 
-OS notes (Thread/Matter): prefer a standard Raspberry Pi OS / Linux network stack; container installs need host networking and correct IPv6/multicast support. See [python-matter-server OS requirements](https://github.com/matter-js/python-matter-server/blob/main/docs/os_requirements.md).
+Start it (and keep it running across reboots):
 
-### 2. Commission the IKEA sensors
+```bash
+docker compose up -d
+docker compose ps
+docker compose logs -f matter-server
+```
 
-Commission the four door/window sensors into **this** Matter Server fabric (not only Apple/Google/HA unless you use multi-admin). Use the Matter Server’s commissioning API / UI / chip-tool workflow you already use for your fabric.
+`restart: unless-stopped` means Docker restarts the container after crashes and after a Pi reboot, until you explicitly stop it (`docker compose stop`).
 
-After commissioning, note each device’s **Matter node ID**.
+WebSocket API: `ws://127.0.0.1:5580/ws`
 
-### 3. Install this app
+**Thread radio tip:** the Matter Server commissions devices onto a Thread network; it does not replace an OpenThread Border Router. Run OTBR with your SONOFF USB dongle (or use an existing border router on the LAN) and use that network’s **Active Operational Dataset (TLV)** below.
+
+## 2. Bind / commission the IKEA sensors (easiest path)
+
+Do this **once per sensor**, into **this** Matter Server fabric.
+
+### Prepare each sensor
+
+1. If the sensor is already linked to Dirigera / Apple / Google / another controller, either:
+   - use that controller’s **share / multi-admin pairing code**, or
+   - factory-reset the sensor so it shows a fresh Matter QR code (`MT:…`) / numeric setup code.
+2. Keep the sensor awake (press the button if needed) and within a few meters of the Pi during BLE commissioning.
+3. Commission **one sensor at a time**.
+
+### Load Thread credentials, then commission
+
+On the Pi (with this project’s venv installed — see step 3), set your Thread dataset TLV and the sensor pairing code:
+
+```bash
+source ~/matter-blind-controller/.venv/bin/activate   # or your venv path
+
+export MATTER_URL="ws://127.0.0.1:5580/ws"
+export THREAD_DATASET="0e08...."   # Active Operational Dataset TLV from your OTBR / Thread UI
+export PAIRING_CODE="MT:Y.ABCDEFG123456789"   # QR payload, or 11-digit manual code
+```
+
+Run:
+
+```bash
+python - <<'PY'
+import asyncio
+import os
+
+import aiohttp
+from matter_server.client.client import MatterClient
+
+URL = os.environ["MATTER_URL"]
+DATASET = os.environ["THREAD_DATASET"]
+CODE = os.environ["PAIRING_CODE"]
+
+async def main() -> None:
+    async with aiohttp.ClientSession() as session:
+        async with MatterClient(URL, session) as client:
+            await client.set_thread_operational_dataset(DATASET)
+            print("Thread dataset set")
+            node = await client.commission_with_code(CODE)
+            print(f"Commissioned OK — node_id={node.node_id}")
+
+asyncio.run(main())
+PY
+```
+
+Repeat for each of the four sensors (new `PAIRING_CODE` each time). Write down the printed `node_id` values — you need them in `config.yaml`.
+
+**Where to get `THREAD_DATASET`:** from your OpenThread Border Router / Thread integration UI as **Active dataset TLVs** (long hex string, often starting with `0e`).
+
+**If BLE fails:** ensure `/run/dbus` is mounted, `--bluetooth-adapter 0` matches your adapter (`hciconfig` / `bluetoothctl list`), and nothing else has exclusive access to the dongle’s Bluetooth radio. For a device already on the Thread network via another controller’s multi-admin share, try the same script with:
+
+```python
+node = await client.commission_with_code(CODE, network_only=True)
+```
+
+### Verify nodes
+
+Start this app (step 5). It logs every Matter node and which ones look like contact sensors. Match those `node_id`s to `top` / `bottom` / `left` / `right`.
+
+## 3. Install this app
 
 ```bash
 cd matter-blind-controller
@@ -70,13 +153,13 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-### 4. Configure
+## 4. Configure
 
 ```bash
 cp config.example.yaml config.yaml
 ```
 
-Edit `config.yaml`:
+Edit `config.yaml` with the `node_id` values from commissioning:
 
 ```yaml
 matter:
@@ -94,9 +177,9 @@ sensors:
   13: right
 ```
 
-Replace `10`–`13` with your real node IDs. Optionally set `MATTER_BLIND_CONFIG` (see `.env.example`).
+Optional: set `MATTER_BLIND_CONFIG` (see `.env.example`).
 
-### 5. Run
+## 5. Run
 
 ```bash
 matter-blind-controller --config config.yaml
@@ -104,9 +187,14 @@ matter-blind-controller --config config.yaml
 python -m matter_blind_controller --config config.yaml
 ```
 
-On connect the app lists all Matter nodes and contact endpoints. Map those `node_id` values into `config.yaml`, restart, and you should see initial states plus live updates when magnets open/close.
+Expected log lines after mapping:
 
-Graceful shutdown: `Ctrl+C` / `SIGTERM`. Connection loss triggers exponential backoff reconnect.
+```text
+top: OPEN
+bottom: CLOSED
+```
+
+Graceful shutdown: `Ctrl+C` / `SIGTERM`. If the Matter Server is briefly down, this app reconnects with exponential backoff.
 
 ## Project layout
 
@@ -123,5 +211,5 @@ pyproject.toml
 ## Out of scope (for now)
 
 - Blind motor / Window Covering control
-- In-app commissioning UI
+- Built-in commissioning UI inside this app
 - Home Assistant integration code
