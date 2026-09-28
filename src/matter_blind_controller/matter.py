@@ -16,7 +16,11 @@ from matter_server.common.models import EventType
 from matter_blind_controller.config import AppConfig
 from matter_blind_controller.sensors import (
     SensorRegistry,
+    battery_percent_from_raw,
+    find_battery_paths,
     find_contact_endpoints,
+    read_battery_charge_level,
+    read_battery_percent,
     read_state_value,
 )
 
@@ -194,6 +198,7 @@ class MatterController:
                 )
 
             self._subscribe_contact(client, name, info.node_id, info.attribute_path)
+            self._subscribe_battery(client, node, name)
             value = read_state_value(node, info.endpoint_id)
             if value is None:
                 LOGGER.warning(
@@ -227,6 +232,52 @@ class MatterController:
             node_id,
             attribute_path,
         )
+
+    def _subscribe_battery(
+        self, client: MatterClient, node: MatterNode, name: str
+    ) -> None:
+        paths = find_battery_paths(node)
+        if not paths:
+            LOGGER.info("No PowerSource battery on %s (node %s)", name, node.node_id)
+            return
+        endpoint_id, percent_path, level_path = paths[0]
+        percent = read_battery_percent(node, endpoint_id)
+        level = read_battery_charge_level(node, endpoint_id)
+        self._registry.handle_battery(node.node_id, percent=percent, charge_level=level)
+        LOGGER.info(
+            "battery %s (node %s): %s%% charge_level=%s",
+            name,
+            node.node_id,
+            percent,
+            level,
+        )
+
+        def _on_percent(_event: EventType, data: Any) -> None:
+            self._registry.handle_battery(
+                node.node_id, percent=battery_percent_from_raw(data)
+            )
+
+        def _on_level(_event: EventType, data: Any) -> None:
+            try:
+                lvl = int(data)
+            except (TypeError, ValueError):
+                return
+            self._registry.handle_battery(node.node_id, charge_level=lvl)
+
+        unsub_p = client.subscribe_events(
+            callback=_on_percent,
+            event_filter=EventType.ATTRIBUTE_UPDATED,
+            node_filter=node.node_id,
+            attr_path_filter=percent_path,
+        )
+        self._unsubscribers.append(unsub_p)
+        unsub_l = client.subscribe_events(
+            callback=_on_level,
+            event_filter=EventType.ATTRIBUTE_UPDATED,
+            node_filter=node.node_id,
+            attr_path_filter=level_path,
+        )
+        self._unsubscribers.append(unsub_l)
 
     def _log_node_summary(self, node: MatterNode) -> None:
         contacts = find_contact_endpoints(node)
